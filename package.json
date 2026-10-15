@@ -4,7 +4,8 @@
   "type": "module",
   "description": "Skills and plugins to accelerate security workflows with the Orca Cloud Platform",
   "scripts": {
-    "test": "node scripts/validate-packaging.mjs"
+    "test": "node scripts/validate-packaging.mjs && node --test scripts/validate-packaging.test.mjs",
+    "test:codex": "node scripts/smoke-test-codex.mjs"
   },
   "repository": {
     "type": "git",

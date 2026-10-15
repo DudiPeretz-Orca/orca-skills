@@ -8,7 +8,7 @@
       "name": "orca-skills",
       "source": {
         "source": "local",
-        "path": "./plugins/orca-skills"
+        "path": "./"
       },
       "policy": {
         "installation": "AVAILABLE",

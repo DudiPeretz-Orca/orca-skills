@@ -10,6 +10,7 @@ No API token or network access required — all tests are pure Python.
 """
 import contextlib
 import inspect
+import json
 import shutil
 import subprocess
 import sys
@@ -23,6 +24,8 @@ _DIR = Path(__file__).parent
 sys.path.insert(0, str(_DIR.parent))             # security-engineer/
 sys.path.insert(0, str(_DIR.parent.parent / "lib"))  # lib/
 
+sys.path.insert(0, str(_DIR))                        # tests/
+import _git_sandbox  # (hermetic git config snapshot)
 import orchestrator
 from config import Config, OrcaCheckConfig, load_config
 from impact_agent import ImpactResult, analyze_impact
@@ -715,7 +718,7 @@ class TestDryRunEnforcement(unittest.TestCase):
         """In dry-run mode, claude subprocess must receive --allowedTools Read (not Edit/Write/Bash)."""
         task = self._make_task()
 
-        with patch("subprocess.run") as mock_run:
+        with patch("orchestrator.run_in_group") as mock_run:
             mock_run.return_value = MagicMock(
                 returncode=0,
                 stdout='{"result": "{\\"status\\": \\"success\\", \\"alert_id\\": \\"orca-test-001\\", \\"files_changed\\": [], \\"diff_summary\\": \\"planned fix\\"}"}',
@@ -742,7 +745,7 @@ class TestDryRunEnforcement(unittest.TestCase):
         `git checkout -- <file>`, which _revert already does, so it gets none."""
         task = self._make_task()
 
-        with patch("subprocess.run") as mock_run:
+        with patch("orchestrator.run_in_group") as mock_run:
             mock_run.return_value = MagicMock(
                 returncode=0,
                 stdout='{"result": "{\\"status\\": \\"success\\", \\"alert_id\\": \\"orca-test-001\\", \\"files_changed\\": [], \\"diff_summary\\": \\"fixed\\"}"}',
@@ -1286,10 +1289,34 @@ class TestFindPackageJsonRoot(unittest.TestCase):
                 ),
             ]
 
+            # The worktree goes in as spelled, and the root comes back resolved.
+            # On macOS a temp dir lives under a symlink (/var -> /private/var),
+            # which is the case that used to fall back to the worktree root.
             for desc, files, expected in CASES:
                 with self.subTest(desc):
                     result = _find_package_json_root(files, tmp)
-                    self.assertEqual(result, expected, desc)
+                    self.assertEqual(result, expected.resolve(), desc)
+
+    def test_worktree_reached_through_a_symlink(self):
+        """The root is found even when the worktree path is not canonical.
+
+        Comparing a resolved candidate against an unresolved worktree path made
+        every lookup fall back to the worktree root — always, on macOS, where
+        /tmp is itself a symlink.
+        """
+        from validator import _find_package_json_root
+
+        with tempfile.TemporaryDirectory() as tmp_str:
+            real = Path(tmp_str) / "aa-real"
+            real.mkdir()
+            self._make_tree(real, {"package.json": None,
+                                   "app": {"package.json": None, "server.js": None}})
+            link = Path(tmp_str) / "zz-link"
+            link.symlink_to(real)
+            self.assertEqual(_find_package_json_root(["app/server.js"], link),
+                             (real / "app").resolve())
+            self.assertEqual(_find_package_json_root(["../../etc/passwd"], link),
+                             real.resolve())
 
 
 class TestFindProjectRoot(unittest.TestCase):
@@ -1355,7 +1382,7 @@ class TestFindProjectRoot(unittest.TestCase):
             for desc, fn, files, marker, expected in CASES:
                 with self.subTest(desc):
                     result = fn(files, tmp, marker) if marker else fn(files, tmp)
-                    self.assertEqual(result, expected, desc)
+                    self.assertEqual(result, expected.resolve(), desc)
 
 
 # ---------------------------------------------------------------------------
@@ -1450,10 +1477,9 @@ class TestBuildPromptContext(unittest.TestCase):
         ]
 
         # Every alert-derived field now leaves fenced, so the extracted value is
-        # inside the result rather than equal to it. file_path and lines are the
-        # two that are not fenced — one is opened as a path, the other is built
-        # here from two integers — so those stay exact.
-        exact = {"file_path", "lines"}
+        # inside the result rather than equal to it. lines is the one that is
+        # not — it is built here from two integers — so it stays exact.
+        exact = {"lines"}
         for desc, alert, expected in CASES:
             with self.subTest(desc):
                 result = _build_prompt_context(alert, "testnonce")
@@ -1568,10 +1594,120 @@ class TestLLMValidationErrors(unittest.TestCase):
                 result = llm_validate({"alert_id": "test-1"}, Path("/tmp"))
                 self.assertTrue(result.passed, f"{desc}: should pass (flagged, not blocked)")
                 self.assertTrue(result.needs_review, f"{desc}: should flag for review")
+                self.assertEqual(result.outcome, "unconfirmed", desc)
                 self.assertTrue(
                     any(expected_substr in f for f in result.failures),
                     f"{desc}: expected '{expected_substr}' in failures: {result.failures}"
                 )
+
+
+class TestLlmVerdictParsing(unittest.TestCase):
+    """Only an explicit "pass" is a pass. Anything the gate cannot read as one
+    of its three verdicts is unconfirmed — it used to fall through to the final
+    `else` and ship as a clean pass with no review marker at all."""
+
+    CASES = [
+        ("explicit pass",        {"verdict": "pass"},             "pass",        False),
+        ("pass in capitals",     {"verdict": " PASS "},           "pass",        False),
+        ("explicit fail",        {"verdict": "fail", "reason": "no"}, "fail",    False),
+        ("fail in capitals",     {"verdict": "Fail", "reason": "no"}, "fail",    False),
+        ("uncertain",            {"verdict": "uncertain"},        "uncertain",   True),
+        ("unknown word",         {"verdict": "approved"},         "unconfirmed", True),
+        ("null verdict",         {"verdict": None},               "unconfirmed", True),
+        ("non-string verdict",   {"verdict": True},               "unconfirmed", True),
+        ("empty verdict",        {"verdict": ""},                 "unconfirmed", True),
+    ]
+
+    def test_cases(self):
+        from validator import _parse_llm
+        for desc, data, outcome, review in self.CASES:
+            with self.subTest(desc):
+                raw = json.dumps({"result": json.dumps(data)})
+                result = _parse_llm(raw)
+                self.assertEqual(result.outcome, outcome, desc)
+                self.assertEqual(result.needs_review, review, desc)
+                self.assertEqual(result.passed, outcome != "fail", desc)
+                if outcome == "unconfirmed":
+                    self.assertTrue(result.failures, f"{desc}: says why")
+
+    def test_garbage_output_is_unconfirmed(self):
+        from validator import _parse_llm
+        for desc, raw in (("prose", "I would like to look at the repo first."),
+                          ("empty", ""),
+                          ("json without a verdict", '{"result": "{\\"ok\\": true}"}')):
+            with self.subTest(desc):
+                result = _parse_llm(raw)
+                self.assertEqual(result.outcome, "unconfirmed", desc)
+                self.assertTrue(result.needs_review, desc)
+
+    def test_unconfirmed_always_needs_review(self):
+        """An unconfirmed result cannot be built without the review flag."""
+        self.assertTrue(ValidationResult(passed=True, phase="llm",
+                                         outcome="unconfirmed").needs_review)
+
+
+class TestUnconfirmedLlmVerdictReachesThePr(unittest.TestCase):
+    """An unconfirmed gate 2 ships labelled, with its own reason in the body —
+    not reworded as an "uncertain" verdict the model never gave."""
+
+    def _run(self, llm_result):
+        task = AlertTask(alert_id="orca-llm-1", title="Path Traversal",
+                         risk_level="high", feature_type="sast", source="server.js:40",
+                         alert_json={"alert_id": "orca-llm-1", "feature_type": "sast"})
+        captured = {}
+
+        def open_pr(t, impact, dry_run):
+            t.pr_body = captured["body"] = orchestrator._build_pr_body(t, impact)
+            return "https://github.com/owner/repo/pull/1"
+
+        val_pass = ValidationResult(passed=True, phase="sanity")
+        with patch("orchestrator._create_worktree", return_value=Path("/tmp/orca-fix-t")), \
+             patch("orchestrator._remove_worktree"), \
+             patch("orchestrator._invoke_fix_agent", return_value=FixAgentResult(
+                 success=True, files_changed=["server.js"], diff_summary="patched")), \
+             patch("orchestrator.sanity_check", return_value=val_pass), \
+             patch("orchestrator.llm_validate", return_value=llm_result), \
+             patch("pipelines.base.local_build_check", return_value=val_pass), \
+             patch("orchestrator._get_diff", return_value="diff"), \
+             patch("orchestrator.analyze_impact", return_value=ImpactResult(
+                 level="low", description="minor", downtime_risk=False,
+                 requires_deploy=True)), \
+             patch("orchestrator._commit_and_pr", side_effect=open_pr), \
+             patch("orchestrator.orca_check_gate",
+                   return_value=ValidationResult(passed=True, phase="orca_check")), \
+             patch("orchestrator.ci_gate",
+                   return_value=ValidationResult(passed=True, phase="ci")), \
+             patch("orchestrator.subprocess.run",
+                   return_value=subprocess.CompletedProcess([], 0, "", "")) as gh:
+            result = run_one(task, dry_run=False, notifier=MagicMock(), repo=Repository(
+                name="owner/repo", url="https://github.com/owner/repo"))
+        return result, captured.get("body", ""), gh
+
+    def test_timeout_is_labelled_and_explained(self):
+        result, body, gh = self._run(ValidationResult(
+            passed=True, phase="llm", outcome="unconfirmed",
+            failures=["LLM validation timed out — flagged for human review"]))
+        self.assertEqual(result.state, "DONE")
+        self.assertTrue(result.needs_review)
+        reason = result.review_reasons[0]
+        self.assertIn("could not confirm", reason)
+        self.assertIn("timed out", reason)
+        self.assertNotIn("uncertain", reason)
+        self.assertIn(reason, body)
+        labels = [c.args[0][-1] for c in gh.call_args_list if "--add-label" in c.args[0]]
+        self.assertIn("needs-review", labels)
+
+    def test_unconfirmed_without_a_reason_still_flags(self):
+        result, body, _ = self._run(ValidationResult(
+            passed=True, phase="llm", outcome="unconfirmed"))
+        self.assertTrue(result.needs_review)
+        self.assertIn("could not confirm", body)
+
+    def test_a_pass_adds_no_marker(self):
+        result, body, _ = self._run(ValidationResult(passed=True, phase="llm",
+                                                     outcome="pass"))
+        self.assertFalse(result.needs_review)
+        self.assertNotIn("Needs human review", body)
 
 
 # ---------------------------------------------------------------------------
@@ -1707,7 +1843,7 @@ class TestOrcaCheckRetry(unittest.TestCase):
         orca_retries = orchestrator.CFG.orca_check.max_retries
         self.assertEqual(mock_fix.call_count, 1 + orca_retries)
 
-    @patch("orchestrator.subprocess.run")
+    @patch("orchestrator.run_in_group")
     def test_feedback_in_prompt(self, mock_run):
         """Verify that feedback text appears in the claude subprocess prompt."""
         mock_run.return_value = subprocess.CompletedProcess(
@@ -2705,6 +2841,14 @@ class TestOrcaFailureMarksTheOpenPr(unittest.TestCase):
 # Runner
 # ---------------------------------------------------------------------------
 
+
+def setUpModule():
+    _git_sandbox.steady_git_config()
+
+
+def tearDownModule():
+    _git_sandbox.release_git_config()
+
 if __name__ == "__main__":
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
@@ -2731,6 +2875,8 @@ if __name__ == "__main__":
         TestBuildPromptContext,
         TestImpactAnalysisErrors,
         TestLLMValidationErrors,
+        TestLlmVerdictParsing,
+        TestUnconfirmedLlmVerdictReachesThePr,
         TestOrcaCheckRetry,
         TestConfig,
         TestDiffLineCount,

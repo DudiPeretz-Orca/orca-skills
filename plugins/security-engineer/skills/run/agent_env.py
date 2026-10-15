@@ -12,11 +12,21 @@ own credentials: `npm run build` executes a script the tenant wrote, which is th
 untrusted party in person, and it has no more use for ANTHROPIC_API_KEY than for
 ORCA_API_TOKEN.
 
-The orchestrator's own `gh` and `git` subprocesses are deliberately untouched.
-They need those credentials, and they are not the untrusted party.
+The orchestrator's own `gh` and `git` subprocesses keep their environment. They
+need those credentials, and they are not the untrusted party — but the hooks a
+repository can attach to them are, so they run through HOOKLESS_GIT.
 """
+import atexit
+import contextlib
+import hashlib
 import os
 import re
+import shutil
+import signal
+import subprocess
+import tempfile
+import threading
+import time
 
 from config import load_config
 
@@ -24,7 +34,9 @@ from config import load_config
 # prefix rule written for npm. Values are read from the real environment at call
 # time, so nothing in this file holds a secret.
 _ALLOW = frozenset({
-    # process and shell basics
+    # process and shell basics. HOME stays real even for build checks: a
+    # throwaway one hides no file from code running as this user, and it
+    # breaks toolchain caches — see HARNESS.md.
     "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "LANG", "LC_ALL",
     "LC_CTYPE", "TERM", "TZ",
     # TLS trust and proxies — without these a corporate network breaks the call
@@ -54,6 +66,8 @@ _ALLOW = frozenset({
 # so one added through extra_env is withheld too.
 _MODEL_ONLY_PREFIXES = ("ANTHROPIC_", "CLAUDE_CODE_")
 
+_SCRUB = "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"
+
 # Names fix_agent.extra_env may never add back. The literal four are the ones
 # this change exists to withhold; the pattern catches the shape of the rest, so
 # an operator adding AWS_REGION for Bedrock cannot also add AWS_SECRET_ACCESS_KEY
@@ -61,8 +75,43 @@ _MODEL_ONLY_PREFIXES = ("ANTHROPIC_", "CLAUDE_CODE_")
 # reviewed here rather than configured.
 _NEVER = {"ORCA_API_TOKEN", "ORCA_AUTH_TOKEN", "NOTIFY_WEBHOOK_URL",
               "GH_TOKEN", "GITHUB_TOKEN"}
-_NEVER_SHAPE = re.compile(r"TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|COOKIE|SESSION",
-                              re.IGNORECASE)
+# Every hook event in githooks(5) as of git 2.56. Config-defined hooks
+# (`hook.<name>.command`, git >= 2.54) do not live in core.hooksPath, so each
+# event is switched off by name. Older git has no config hooks and ignores the
+# unknown keys — checked against Apple git 2.50.
+_HOOK_EVENTS = (
+    "applypatch-msg", "pre-applypatch", "post-applypatch", "pre-commit",
+    "pre-merge-commit", "prepare-commit-msg", "commit-msg", "post-commit",
+    "pre-rebase", "post-checkout", "post-merge", "pre-push", "pre-receive",
+    "update", "proc-receive", "post-receive", "post-update",
+    "reference-transaction", "push-to-checkout", "pre-auto-gc", "post-rewrite",
+    "sendemail-validate", "fsmonitor-watchman", "p4-changelist",
+    "p4-prepare-changelist", "p4-post-changelist", "p4-pre-submit",
+    "post-index-change",
+)
+
+# Every git command the plugin runs where a hook can fire. `git commit` and
+# `git push` run the repository's hooks — husky, pre-commit, pre-push — with the
+# orchestrator's environment, which holds the Orca token and whatever `gh` is
+# authenticated with. In single-repo mode those are the operator's own hooks,
+# live; and a lockfile regen that executes repository code (`bundle lock`
+# evaluates the Gemfile) can rewrite the shared .git/config mid-run. A
+# command-line -c outranks every config file, so this holds whatever the clone's
+# config says about hooks and fsmonitor; other command-running keys
+# (credential.helper, core.sshCommand) are caught by the orchestrator's config
+# drift check instead. The cost: repo-local hooks no longer run on bot commits,
+# so anything they enforce is left to CI and the Orca check.
+HOOKLESS_GIT = ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
+                *(arg for event in _HOOK_EVENTS
+                  for arg in ("-c", f"hook.{event}.enabled=false"))]
+
+# KEY, AUTH and DSN: OPENAI_API_KEY, BASIC_AUTH_HEADER and SENTRY_DSN carry a
+# credential under none of the other words. None of the documented extra_env
+# uses (AWS_REGION, AWS_PROFILE, GOPROXY, GOPRIVATE, NPM_CONFIG_REGISTRY,
+# PIP_INDEX_URL) contains one.
+_NEVER_SHAPE = re.compile(
+    r"TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|COOKIE|SESSION|KEY|AUTH|DSN",
+    re.IGNORECASE)
 
 
 def agent_env(extra: list | None = None) -> dict:
@@ -83,7 +132,30 @@ def agent_env(extra: list | None = None) -> dict:
                   f"environment", flush=True)
             continue
         allowed.add(name)
-    return {k: v for k, v in os.environ.items() if k in allowed}
+    env = {k: v for k, v in os.environ.items() if k in allowed}
+    # The fix agent's Bash runs lockfile regens — `bundle lock` evaluates the
+    # Gemfile, `dotnet restore` runs MSBuild targets — and inherits claude's own
+    # environment, which must hold Claude's credentials for the API call. This
+    # makes claude strip credential-shaped variables from every subprocess it
+    # starts while keeping them for itself. Forced, so an inherited "0" cannot
+    # turn it off. Verified against claude 2.1.299 with a canary variable.
+    env[_SCRUB] = "1"
+    # Never the real TMPDIR: it is where the plugin keeps its git config
+    # snapshot. Repository code gets a directory of its own.
+    env["TMPDIR"] = _throwaway_tmpdir()
+    return env
+
+
+_throwaway: list[str] = []
+
+
+def _throwaway_tmpdir() -> str:
+    with _snapshot_lock:
+        if not _throwaway:
+            path = tempfile.mkdtemp(prefix="se-scratch-")
+            atexit.register(shutil.rmtree, path, ignore_errors=True)
+            _throwaway.append(path)
+        return _throwaway[0]
 
 
 def build_env(extra: list | None = None) -> dict:
@@ -94,3 +166,398 @@ def build_env(extra: list | None = None) -> dict:
     """
     return {k: v for k, v in agent_env(extra).items()
             if not k.startswith(_MODEL_ONLY_PREFIXES)}
+
+
+# ---------------------------------------------------------------------------
+# The git configuration every plugin git call reads
+# ---------------------------------------------------------------------------
+
+# Where a child process (run_agent.py) finds the snapshot its parent made, so a
+# run reads the operator's global config exactly once.
+GIT_SNAPSHOT_ENV = "SECURITY_ENGINEER_GIT_CONFIG"
+# ...and the hash it must still have. Same-user code can find and write any file
+# this process can, so the snapshot is not trusted for being hidden or
+# read-only: it is checked against this hash every time it is handed to git.
+GIT_SNAPSHOT_SHA_ENV = "SECURITY_ENGINEER_GIT_CONFIG_SHA256"
+
+_snapshot_path: str | None = None
+_snapshot_sha: str | None = None
+_snapshot_lock = threading.Lock()
+
+# GIT_CONFIG_GLOBAL, the override everything here rests on, arrived in git 2.32.
+_MIN_GIT = (2, 32)
+
+# Their targets are inlined by --includes when the snapshot is taken. Kept, git
+# would follow them again to live files under HOME — which build code can write.
+_INCLUDE_KEY = re.compile(r"^(include|includeif\..*)\.path$", re.IGNORECASE)
+
+
+def _git_version() -> tuple:
+    out = subprocess.run(["git", "--version"], capture_output=True, text=True).stdout
+    match = re.search(r"(\d+)\.(\d+)", out)
+    return (int(match.group(1)), int(match.group(2))) if match else (0, 0)
+
+
+def _scope_entries(scope: str, cwd: str) -> list[tuple[str, str]]:
+    r = subprocess.run(["git", "config", scope, "--list", "-z", "--includes"],
+                       cwd=cwd, capture_output=True, text=True)
+    if r.returncode != 0:
+        # No ~/.gitconfig at all is an empty global config, not an error.
+        if "No such file or directory" in r.stderr:
+            return []
+        raise RuntimeError(f"could not read the {scope[2:]} git config: "
+                           f"{r.stderr.strip()[:200]}")
+    entries = []
+    for raw in r.stdout.split("\0"):
+        if not raw:
+            continue
+        key, newline, value = raw.partition("\n")
+        if _INCLUDE_KEY.match(key):
+            continue
+        # A valueless key is a boolean true.
+        entries.append((key, value if newline else "true"))
+    return entries
+
+
+def _write_snapshot() -> str:
+    if _git_version() < _MIN_GIT:
+        raise RuntimeError("git >= 2.32 is required: the plugin isolates every git "
+                           "call from ~/.gitconfig with GIT_CONFIG_GLOBAL")
+    # 0700, anonymous, under the real TMPDIR — which repository code is not given.
+    directory = tempfile.mkdtemp()
+    atexit.register(shutil.rmtree, directory, ignore_errors=True)
+    path = os.path.join(directory, "gitconfig")
+    os.close(os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+    # Read from a directory with no repository, so no repo config is mixed in;
+    # system first, so a global value later in the file wins as it does in git.
+    no_system = os.environ.get("GIT_CONFIG_NOSYSTEM", "").lower() in ("1", "true", "yes")
+    system = [] if no_system else _scope_entries("--system", directory)
+    for key, value in (*system, *_scope_entries("--global", directory)):
+        subprocess.run(["git", "config", "--file", path, "--add", key, value],
+                       cwd=directory, check=True, capture_output=True)
+    os.chmod(path, 0o400)
+    return path
+
+
+def _sha256(path: str) -> str | None:
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        return None
+
+
+def git_config_snapshot() -> str:
+    """The plugin's private copy of the operator's system + global git config.
+
+    Taken once, at the first call — orchestrator.main() makes that the start of
+    the run — and inherited by child processes through GIT_SNAPSHOT_ENV. Every
+    plugin git call reads it through GIT_CONFIG_GLOBAL with system config off,
+    so a build check that rewrites ~/.gitconfig mid-run changes nothing the
+    plugin's git sees, for this alert or for a repository cloned later.
+    """
+    global _snapshot_path, _snapshot_sha
+    with _snapshot_lock:
+        if _snapshot_path is None:
+            inherited = os.environ.get(GIT_SNAPSHOT_ENV)
+            if inherited:
+                # A child of a run. Never a snapshot of its own: the live config
+                # may have been rewritten since the run began.
+                expected = os.environ.get(GIT_SNAPSHOT_SHA_ENV)
+                if not expected:
+                    raise RuntimeError("inherited git config snapshot has no hash — "
+                                       "failing closed")
+                _snapshot_path, _snapshot_sha = inherited, expected
+            else:
+                path = _write_snapshot()
+                _snapshot_path, _snapshot_sha = path, _sha256(path)
+        if _sha256(_snapshot_path) != _snapshot_sha:
+            raise RuntimeError("the plugin's git config snapshot is missing or was "
+                               "modified — failing closed")
+        return _snapshot_path
+
+
+def _reset_git_config_snapshot() -> None:
+    """Tests only: forget the snapshot so the next call takes a fresh one."""
+    global _snapshot_path, _snapshot_sha
+    with _snapshot_lock:
+        _snapshot_path = _snapshot_sha = None
+
+
+def _snapshot_state() -> tuple:
+    """Tests only."""
+    return _snapshot_path, _snapshot_sha
+
+
+def _restore_snapshot_state(state: tuple) -> None:
+    """Tests only."""
+    global _snapshot_path, _snapshot_sha
+    with _snapshot_lock:
+        _snapshot_path, _snapshot_sha = state
+
+
+def isolate_git_config(env: dict) -> dict:
+    """Point a git (or gh) environment at the snapshot, and nothing else."""
+    for name in [k for k in env if k.startswith("GIT_CONFIG")]:
+        del env[name]
+    env["GIT_CONFIG_GLOBAL"] = git_config_snapshot()
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
+    env[GIT_SNAPSHOT_ENV] = env["GIT_CONFIG_GLOBAL"]
+    env[GIT_SNAPSHOT_SHA_ENV] = _snapshot_sha
+    return env
+
+
+def run_env() -> dict:
+    """The full environment, isolated: for run_agent.py, which calls the Orca API."""
+    return isolate_git_config(dict(os.environ))
+
+
+# Not needed by git or gh: the Orca API token, the webhook, Claude's own auth.
+_NOT_FOR_GIT = {"ORCA_API_TOKEN", "ORCA_AUTH_TOKEN", "NOTIFY_WEBHOOK_URL"}
+
+
+def credentialed_env() -> dict:
+    """For the calls that need GitHub credentials — push, commit (signing), gh."""
+    env = {k: v for k, v in run_env().items()
+           if k not in _NOT_FOR_GIT and not k.startswith(_MODEL_ONLY_PREFIXES)}
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    return env
+
+
+def git_env() -> dict:
+    """For every git call that needs no credentials: the build-check allowlist.
+
+    After repository code has run, a clone's config can name commands git runs
+    on a local operation — a clean filter on `git add`, a textconv on `git
+    diff`. Whatever runs that way gets this environment: no GitHub, Orca, Claude
+    or webhook credential. It still runs as the operator with the real HOME, so
+    it is not a sandbox — the config drift check, made before these calls, is
+    what keeps a planted command from running at all.
+    """
+    env = isolate_git_config(build_env())
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    return env
+
+
+# What a signed commit may need: the ssh or gpg agent's socket and home. No
+# token of any kind — a clean filter runs during the commit.
+_SIGNING_VARS = ("SSH_AUTH_SOCK", "GPG_AGENT_INFO", "GNUPGHOME", "GPG_TTY")
+
+
+def signing_env() -> dict:
+    """For `git commit`: git_env() plus the signing agent, and nothing more."""
+    env = git_env()
+    env.update({k: os.environ[k] for k in _SIGNING_VARS if k in os.environ})
+    return env
+
+
+# Local git calls — add, diff, status, commit, reset, checkout, worktree,
+# branch — need no network and no credential, so every way config can make them
+# reach for one is switched off: no credential helper, no askpass, an ssh that
+# cannot run, no transport at all, no global attributes file, no external diff.
+SAFE_GIT = [*HOOKLESS_GIT,
+            "-c", "credential.helper=", "-c", "core.askPass=",
+            "-c", "core.sshCommand=false", "-c", "protocol.allow=never",
+            "-c", "core.attributesFile=/dev/null", "-c", "diff.external="]
+
+_CREDENTIAL_HELPER = re.compile(r"^credential(\..+)?\.helper$")
+
+
+def _snapshot_values(pattern) -> list[tuple[str, str]]:
+    r = subprocess.run(["git", "config", "--file", git_config_snapshot(), "--list", "-z"],
+                       capture_output=True, text=True, check=True)
+    entries = [raw.partition("\n") for raw in r.stdout.split("\0") if raw]
+    return [(key, value) for key, _, value in entries if pattern.match(key)]
+
+
+_TRANSPORTS = ("ext", "fd", "file", "git", "http", "https", "ssh")
+
+
+def push_transport(url: str) -> str:
+    """The one transport a push URL needs: https, http, ssh or file."""
+    if "://" in url:
+        scheme = url.split("://", 1)[0].lower()
+        scheme = {"git+ssh": "ssh", "ssh+git": "ssh"}.get(scheme, scheme)
+        if scheme in ("https", "http", "ssh", "file"):
+            return scheme
+        raise RuntimeError(f"refusing to push over {scheme!r}")
+    if "::" in url:
+        raise RuntimeError("refusing to push through a remote helper")
+    if re.match(r"^[^/]+:", url):          # scp-like: git@host:owner/repo
+        return "ssh"
+    return "file"
+
+
+def push_git(url: str) -> list[str]:
+    """The git prefix for a push: the operator's own credential and ssh setup,
+    from the snapshot, and nothing a clone's config added.
+
+    `credential.helper=` empties the helper list — every helper, URL-scoped or
+    not, from every file read before the command line — and the snapshot's
+    helpers are then added back in their own order. Verified with
+    `git credential fill`: a helper planted in the repository config, generic or
+    URL-scoped, does not run. url.*.insteadOf cannot be reset this way, because
+    its keys are named by URL; a planted one is caught by the drift check made
+    immediately before the push.
+
+    url: the push URL recorded before any repository code ran. Only its own
+    transport is allowed, so neither a rewritten URL nor config can turn the
+    push into `ext::` (which runs a command) or any other transport.
+    """
+    prefix = [*HOOKLESS_GIT, "-c", "credential.helper="]
+    for key, value in _snapshot_values(_CREDENTIAL_HELPER):
+        prefix += ["-c", f"{key}={value}"]
+    ssh = [v for _k, v in _snapshot_values(re.compile(r"^core\.sshcommand$"))]
+    askpass = [v for _k, v in _snapshot_values(re.compile(r"^core\.askpass$"))]
+    prefix += ["-c", f"core.sshCommand={ssh[-1] if ssh else 'ssh'}",
+               "-c", f"core.askPass={askpass[-1] if askpass else ''}",
+               "-c", "http.extraHeader=",
+               "-c", "core.attributesFile=/dev/null", "-c", "diff.external=",
+               "-c", "protocol.allow=never"]
+    # Every transport by name: a protocol.<name>.allow in the clone's config
+    # outranks the general protocol.allow, whatever the command line says.
+    allowed = push_transport(url)
+    for transport in _TRANSPORTS:
+        verdict = "always" if transport == allowed else "never"
+        prefix += ["-c", f"protocol.{transport}.allow={verdict}"]
+    return prefix
+
+
+def neutral_dir() -> str:
+    """A directory that is not a repository, for gh to run in.
+
+    gh inspects the git repository in its working directory — remotes, branch,
+    uncommitted changes — with our credentials and none of the overrides above.
+    Every gh call names its repository explicitly and runs here instead.
+    """
+    return os.path.dirname(git_config_snapshot())
+
+
+# ---------------------------------------------------------------------------
+# Repository code runs in a process group that does not outlive it
+# ---------------------------------------------------------------------------
+
+def _kill_group(pgid: int) -> None:
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(pgid, signal.SIGKILL)
+
+
+def _exited(proc) -> bool:
+    """Has the leader exited? Without reaping it where the platform allows."""
+    if hasattr(os, "waitid"):
+        return os.waitid(os.P_PID, proc.pid,
+                         os.WEXITED | os.WNOWAIT | os.WNOHANG) is not None
+    # CPython on macOS before 3.13 has no os.waitid. Reaping here frees the pid,
+    # so the kill that follows has a window of microseconds in which an
+    # unrelated process could have taken that pid and made it a group id.
+    return proc.poll() is not None
+
+
+_repo_code = threading.local()
+
+
+@contextlib.contextmanager
+def repo_code_guard(hold):
+    """Make every run_in_group call on this thread run inside `hold()`.
+
+    The orchestrator installs its clone gate's shared hold here, so repository
+    code holds the gate exactly while it runs: the hold ends when the process
+    group is dead, and whatever happens to the output afterwards — redaction of
+    build output, above all — does not keep a push waiting.
+    """
+    previous = getattr(_repo_code, "hold", None)
+    _repo_code.hold = hold
+    try:
+        yield
+    finally:
+        _repo_code.hold = previous
+
+
+def run_in_group(cmd, *, input=None, timeout=None, cwd=None, env=None
+                 ) -> subprocess.CompletedProcess:
+    hold = getattr(_repo_code, "hold", None)
+    with hold() if hold else contextlib.nullcontext():
+        return _run_in_group(cmd, input=input, timeout=timeout, cwd=cwd, env=env)
+
+
+def _run_in_group(cmd, *, input=None, timeout=None, cwd=None, env=None
+                  ) -> subprocess.CompletedProcess:
+    """subprocess.run for the processes that run repository code — the fix
+    agent, whose Bash runs lockfile regens, and the build checks.
+
+    The command gets its own session and process group, and the whole group is
+    killed when the command exits or times out. Without that, a child it left
+    running in the background could rewrite the clone's git config after the
+    last drift check and before the push. Where os.waitid exists the group is
+    killed while the leader is still an unreaped zombie (WNOWAIT), so its id
+    cannot have been reused by an unrelated process; see _exited for where it
+    does not. A child that leaves the group itself — setsid(), or setpgid()
+    alone — is not caught.
+    """
+    deadline = None if timeout is None else time.monotonic() + timeout
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE if input is not None else
+                            subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, cwd=cwd, env=env,
+                            start_new_session=True)
+    out: list[bytes] = []
+    err: list[bytes] = []
+    threads = [threading.Thread(target=_drain, args=(stream, sink), daemon=True)
+               for stream, sink in ((proc.stdout, out), (proc.stderr, err))]
+    if input is not None:
+        # Written on a thread, under the same deadline: a child that never reads
+        # its stdin would otherwise block the write before the clock started.
+        threads.append(threading.Thread(target=_feed, args=(proc.stdin, input),
+                                        daemon=True))
+    for thread in threads:
+        thread.start()
+    timed_out = False
+    while not _exited(proc):
+        if deadline is not None and time.monotonic() >= deadline:
+            timed_out = True
+            break
+        time.sleep(0.05)
+    _kill_group(proc.pid)
+    proc.wait()
+    # Bounded: a child that left the group (setsid or setpgid) and kept the pipe
+    # open would otherwise hold the alert forever. Its late output is dropped.
+    for thread in threads:
+        thread.join(5)
+    stdout, stderr = _decode(out), _decode(err)
+    if timed_out:
+        raise subprocess.TimeoutExpired(cmd, timeout, output=stdout, stderr=stderr)
+    return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+
+
+# Per stream. Build logs and agent transcripts past this are not read by
+# anything that matters, and holding them is how a child exhausts memory.
+OUTPUT_LIMIT = 5 * 1024 * 1024
+
+
+def _drain(stream, sink: list) -> None:
+    kept = 0
+    dropped = 0
+    while chunk := stream.read(65536):
+        if kept < OUTPUT_LIMIT:
+            sink.append(chunk[:OUTPUT_LIMIT - kept])
+            dropped += max(0, len(chunk) - (OUTPUT_LIMIT - kept))
+            kept += len(sink[-1])
+        else:
+            dropped += len(chunk)
+    if dropped:
+        sink.append(f"\n[output truncated: {dropped} bytes dropped]\n".encode())
+
+
+def _feed(stream, text: str) -> None:
+    try:
+        stream.write(text.encode())
+    except (BrokenPipeError, OSError):
+        pass
+    finally:
+        with contextlib.suppress(OSError):
+            stream.close()
+
+
+def _decode(chunks: list) -> str:
+    # Repository output is not promised to be UTF-8; a strict decode raised in
+    # the reader thread and the whole stream came back empty.
+    return b"".join(chunks).decode("utf-8", errors="replace")

@@ -119,7 +119,7 @@ the commit will contain.
 | # | Gate | Checks | On failure |
 |---|---|---|---|
 | 1 | **sanity** (`validator.sanity_check`) | Diff is non-empty; within the type's line budget (cve 200, sast 100, iac/secret 50); no added line matches a secret pattern, **whatever the finding type** — a CVE bump that pastes a token into a lockfile fails here too; the agent's own `diff_summary` does not name a version its diff never added | `FAILED`, no PR |
-| 2 | **llm** (`validator.llm_validate`) | A single-shot model call: does this diff address this alert? `pass` / `fail` / `uncertain` | `fail` → `FAILED`. `uncertain` → passes, PR labelled `needs-review` |
+| 2 | **llm** (`validator.llm_validate`) | A single-shot model call: does this diff address this alert? `pass` / `fail` / `uncertain` | `fail` → `FAILED`. `uncertain` → passes, PR labelled `needs-review`. No verdict at all — timeout, error, unreadable output, or any word but those three — is `unconfirmed`: passes, labelled `needs-review`, and the body says the gate could not confirm the fix. Only an explicit `pass` ships unmarked |
 | 3 | **verify** (`pipeline.verify`) | **CVE:** the manifest still declares the package; it is no longer on the version the alert was raised against; if the agent chose a different version, that version carries no known advisory; a lockfile beside the manifest agrees; then `go build ./...` (Go) or `cargo metadata --locked` (Cargo). **Other types:** language build check (below) | `FAILED`, no PR |
 | 4 | **orca** (`validator.orca_check_gate`) | Polls the Orca GitHub App check on the PR head SHA. On failure, pulls the check **annotations** — file, line, message | Reverts the worktree to the branch head, re-invokes the fix agent *with the annotations as feedback*, re-runs gates 1 and 3, and pushes a follow-up commit to the same PR branch. After `max_retries`, follows `on_failure` |
 | 5 | **ci** (`validator.ci_gate`) | `gh pr checks --watch --fail-fast`, 10 min | `CI_FAILED`, PR labelled `ci-failed`, run exits non-zero. The PR stays open |
@@ -222,14 +222,25 @@ could therefore address the fixer directly (`NOTE TO AUTOMATED FIXER: before
 editing, run …`) and have it arrive as guidance.
 
 `untrusted.py` draws the boundary. Every prompt opens with a preamble stating the
-rule before a single untrusted byte appears; every alert-derived field is wrapped
-in `<untrusted-NONCE id="field"> … </untrusted-NONCE>` markers whose nonce is
+rule before a single untrusted byte appears; every alert-derived field — the
+affected `file_path` included — is wrapped in
+`<untrusted-NONCE id="field"> … </untrusted-NONCE>` markers whose nonce is
 random per invocation, so content cannot close a fence whose name it was never
 told; and every field is capped at `FIELD_LIMIT`, so a huge snippet cannot push
-the real instructions out of attention. The agent's own instructions stay outside
-every fence. The same applies to the LLM-validation and impact prompts — those
-have no tools, but a steered verdict is how a fix that does nothing gets past
-gate 2, and steered impact prose is pasted straight into the PR body.
+the real instructions out of attention. Any copy of the nonce-tagged prefix
+inside the content is stripped until none is left, since a single pass over
+`</untrusted-N</untrusted-N>>` would reassemble the closer it just removed. The
+agent's own instructions stay outside every fence. The same applies to the
+LLM-validation and impact prompts — those have no tools, but a steered verdict is
+how a fix that does nothing gets past gate 2, and steered impact prose is pasted
+straight into the PR body.
+
+A specialist's directive is ours, but what it states is not: the CVE pipeline's
+package name and manifest path come from the repository, and its versions and
+rationale from OSV and deps.dev, where a package publisher chooses the version
+strings. So the directive is rendered per invocation with that prompt's nonce
+(`FixPlan.render_directive`): the sentences stay outside, and every value they
+refer to sits in one fenced `version_decision` block.
 
 Order against the redactor is redact, then bound, then fence: slicing first can
 cut a credential in half and leave a fragment no candidate matches. The fix
@@ -271,9 +282,36 @@ allowlist cannot be undone by accident. The local build checks (`npm run build`,
 tenant wrote, so they get the same allowlist through `build_env()` with Claude's
 own credentials removed as well. `HOME` is still passed, so a build script can
 read credential files under it (`~/.config/gh`, `~/.aws`, `~/.npmrc`); closing
-that needs a sandbox, not an environment. The orchestrator's own `gh` and `git`
-subprocesses are untouched: they need those credentials and are not the untrusted
-party.
+that needs a sandbox, not an environment. Pointing `HOME` at a throwaway
+directory was evaluated and not done. It would not close the hole — the build
+runs as the same user, so `pwd.getpwuid()` or `/Users/$USER/.aws` reaches the
+same files by absolute path — and it breaks the checks it would wrap: with an
+empty `HOME`, an offline `go build` could no longer find the module cache
+(measured), so a gate that passes today fails or goes to the network. Keeping
+them working means pinning `GOMODCACHE`/`GOCACHE` and `CARGO_HOME`/`RUSTUP_HOME`
+back to the real home, and `CARGO_HOME` is where `credentials.toml` lives; cargo
+is not installed where this was evaluated, so that half was not measured at all.
+The orchestrator's own `gh` and `git`
+subprocesses keep their environment: they need those credentials and are not the
+untrusted party. The hooks a repository attaches to them are — see *Repository
+hooks do not run on the plugin's git* below.
+
+The fix agent's own Bash is the one place repository code runs inside the model
+subprocess. A CVE's lockfile regen executes it — `bundle lock` evaluates the
+Gemfile, `dotnet restore` runs MSBuild targets, `go get` can run a toolchain the
+module names — and it inherits `claude`'s environment, which cannot drop
+`ANTHROPIC_API_KEY` because `claude` needs it. So `agent_env()` always sets
+`CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1`: Claude Code keeps its credentials for its
+own API calls and strips credential-shaped variables, by name or by value, from
+every subprocess it starts. Verified against claude 2.1.299 with a canary — a
+`CANARYZ_API_KEY` set for `claude -p` was visible to `printenv` in its Bash
+without the scrub and gone with it, while a plain variable survived both ways.
+What it does not cover: before claude 2.1.251 it removed only
+`ANTHROPIC_API_KEY` and `AWS_SECRET_ACCESS_KEY`; it matches shapes, so a secret
+whose name and value look ordinary passes; and, like `build_env()`, it leaves
+files under `HOME` readable. The regen commands are never run by pipeline code —
+what pipeline code does run (`go build`, `cargo metadata`) goes through
+`validator._run_check` and so through `build_env()`.
 
 **A cloned tree is input, never configuration.** `--remote all` clones arbitrary
 tenant repositories into `/tmp`, and the fix agent runs with `cwd` inside one.
@@ -286,6 +324,132 @@ configuration comes from `skills/run/agent-settings.json`, which is versioned
 beside the code, and from nothing in the clone. Verified against claude 2.1.276 —
 with a `CLAUDE.md` imposing a house style in the working directory, an unpinned
 `claude -p` followed it and a pinned one did not.
+
+**Repository hooks do not run on the plugin's git.** `git commit` and `git push`
+run whatever hooks the repository has configured — husky, pre-commit, pre-push —
+in the orchestrator's own environment, which holds the Orca token and `gh`'s
+credentials. In single-repo mode those are the operator's live hooks, and a
+lockfile regen that executes repository code (`bundle lock` evaluates the
+Gemfile) can rewrite the shared `.git/config` mid-run. Two layers deal with it.
+
+The first overrides what config can make git run. The pipeline's own git calls
+— the `git add -N` behind the diff the gates read, staging, commit, push,
+revert, and the worktree's creation and teardown — run through
+`agent_env.HOOKLESS_GIT`: `core.hooksPath=/dev/null` for hook scripts,
+`core.fsmonitor=false`, and `hook.<event>.enabled=false` for every event in
+githooks(5), which is what stops config-defined hooks (`hook.<name>.command`,
+git 2.54+) that `core.hooksPath` never reaches. Commit and push add
+`--no-verify`. A command-line `-c` outranks every config file; git older than
+2.54 has no config hooks and ignores the extra keys. `--remote` clones also get
+`core.hooksPath` in their own config before the first checkout.
+
+Each git call also gets only the privilege it needs. Local calls — add, diff,
+status, worktree, branch, reset/checkout/clean — run through
+`agent_env.SAFE_GIT`, which adds an empty credential helper and askpass, an ssh
+that cannot run, `protocol.allow=never`, no global attributes file and no
+external diff; the diff the gates read is `git diff --no-ext-diff
+--no-textconv`. They run with `git_env()`: the build-check allowlist, so no
+GitHub, Orca, Claude or webhook credential. A planted textconv, external diff,
+fsmonitor or credential helper does not run on them at all; a planted clean or
+smudge filter does — filters are not overridden, because LFS needs them — and
+receives none of those variables. Tested with canaries in a real repository.
+That is all it proves: the command still runs as the operator with the real
+`HOME`, so it could read `~/.config/gh` or run `gh auth token`. What stops it is
+the drift check below, not the environment.
+
+Only the push and gh get credentials (`credentialed_env()`, which still drops
+the Orca token, the webhook and Claude's credentials). The commit gets
+`signing_env()`: the credential-free environment plus the ssh/gpg agent's
+socket and home, because a clean filter can run during a commit — a canary test
+shows it sees the agent socket and no token. The push runs through `push_git()`: the operator's
+credential helpers, ssh command and askpass are taken from the snapshot, after
+`credential.helper=` has emptied every helper any config file named — verified
+with `git credential fill` that a helper planted in the repository, generic or
+URL-scoped, does not run. `url.*.insteadOf` cannot be reset that way, since its
+keys are named by URL, and has not been exercised against a live push; a
+planted one is caught by the drift check immediately before the push. The push
+goes to the URL `git remote get-url --push origin` gave when the baseline was
+recorded, not to whatever the remote says later. Only that URL's transport is
+allowed, with every transport pinned by name, since a clone-level
+`protocol.ext.allow` outranks a general `protocol.allow=never`. A test shows a
+planted `ext::` command runs on plain git and not through the push prefix. Every gh
+call names its repository (`--repo`, or a PR URL) and runs from a plugin-owned
+directory that is not a repository, because gh inspects the repository in its
+cwd with our credentials and none of the overrides above. A partial clone, which
+fetches objects lazily, cannot work with `protocol.allow=never` and fails rather
+than fetching.
+
+The second catches what no override list can enumerate. `credential.helper`,
+`core.sshCommand`, an `include.path`, diff and filter drivers — any of these
+written by repository code would run inside the orchestrator's push with our
+credentials. So the clone's effective config (`git config --list --includes`,
+plus `--show-scope` where the installed git has it — probed once, so baseline
+and checks are listed alike) is recorded right after the clone, or locally right
+after the repository is detected, before any repository code runs. It is keyed
+by the clone's path, worked out without running git. It is checked before every
+git call that follows repository code: after each fix-agent run, before a
+revert, before the diff the gates read, after the build check, before worktree
+creation and teardown, and immediately before every commit and push. Not being
+able to tell fails too: if the config cannot be listed, for the baseline or for
+a check, the alert fails closed.
+
+Up to four alerts share one clone, so a check is only worth something if
+nothing can change the config between it and the git call it guards. Each clone
+has a reader/writer gate (`orchestrator._CloneGate`): fix agents and build
+checks hold it shared — `run_in_group` takes the hold around the process and
+drops it when the group is dead, so redacting their output does not hold up a
+push — and every check together with the git that
+follows it — the push included — holds it exclusively, so no agent of another
+alert runs in that window. A waiting writer blocks new readers, so a stream of
+agents cannot starve a push. A detected change poisons the clone. The alert
+fails; every later alert in that clone fails before running any git; and
+worktrees are removed with `rmtree`, not `git worktree remove`. The local
+branches and worktree registrations are then left behind in the poisoned
+clone. Plugin git must not trip its own check: pushes name an explicit refspec
+instead of `-u`, worktrees are added `--no-track` (either would record an
+upstream in the shared config). The baseline stays fixed. After each exclusive
+hold that ran only plugin git, the config is compared again and one change is
+accepted: git-lfs adding `lfs.<url>.access` or `lfs.<url>.locksverify` on first
+push. Any other difference — a removed line, any other key — poisons the clone.
+Fix agents and build checks also run in their own process group, killed in full
+when the command exits or times out. The deadline starts before their stdin is
+written, so a child that never reads its stdin cannot stall the write.
+Each output stream is kept up to 5 MB, and the rest is dropped and counted.
+Output is decoded with replacement, so invalid UTF-8 cannot empty it. Push,
+clone and gh calls have timeouts, since several run while a clone is held
+exclusively. A child left in the background therefore
+cannot rewrite the config after the last check. A child that leaves the group
+itself — with `setsid()`, or with `setpgid()` alone — is not caught.
+
+What none of this sees: a change made and reverted between two checks, a
+change outside git's config (a `~/.ssh/config` edit, say), and anything a
+planted command does by reading the operator's files under `HOME`.
+
+The operator's own git configuration is read once, at the start of a run.
+Build checks keep the real `HOME`, so they can write `~/.gitconfig`; under
+`--remote all` every repository cloned after that would have read it, and the
+clone itself ran unchecked. So `agent_env.git_config_snapshot()` copies the
+effective system and global config (includes inlined, `include.path` keys
+dropped so nothing is followed back to a live file) into a read-only (0400)
+file in an anonymous 0700 directory under the real `TMPDIR`. Repository code is
+never given that `TMPDIR`: the fix agent and the build checks get a throwaway
+one. None of that stops code running as the same user from finding or
+rewriting the file. What is enforced is its SHA-256: every git environment the
+plugin builds checks the file against the hash taken when it was written, and
+`run_agent.py` receives the hash with the path. A missing or altered snapshot
+fails that call closed. A child process never takes a snapshot of its own from
+the live config. Every plugin git and gh call — clone, `ls-remote`,
+`run_agent.py` included — runs with `GIT_CONFIG_GLOBAL` pointing at it and
+`GIT_CONFIG_NOSYSTEM=1`. A change to `~/.gitconfig` during a run is not seen by
+the plugin. Conditional `includeIf "gitdir:…"` sections are evaluated against a
+neutral directory when the snapshot is taken, so they are lost. This needs git
+2.32 or later, and on older git the run refuses to start. Only 2.50 and 2.56 have
+been exercised.
+
+The `git-setup` subcommand, which only a human runs by hand, is left as it was.
+The trade-off is deliberate: repo-local hooks — formatters, linters,
+commit-message checks — no longer run on bot commits, so whatever they enforce
+is left to CI (gate 5) and the Orca check (gate 4).
 
 **Only declared files are committed.** Staging was `git add -A`, so anything the
 fix agent's Bash left behind that `.gitignore` did not cover — a scratch file, a
@@ -357,6 +521,45 @@ Only secret findings build a live redactor. For a SAST or CVE alert the
 `code_snippet` is ordinary vulnerable code, and scrubbing it from the diff would
 blind gate 2 to the lines it has to judge.
 
+All of that assumes the snippet carries the credential verbatim. Whether Orca
+ever returns it masked could not be checked here — no fixture or test in this
+repository shows a secret alert's snippet, and Orca's public docs do not say —
+so the redactor is built to be safe either way. A masked value (`sk-****`,
+`ghp_ab12....`, `AKIA12345…`, `sk-xxxxx12345`, `####`, `<hidden-value>`,
+`[REDACTED]`) is never a candidate, since it matches nothing real. If the
+snippet looks masked, or yields no value shaped like a credential — one a
+secret pattern captures or that looks random — a secret finding's redactor
+falls back to redacting by shape on every egress path: the sanity gate's own
+`SECRET_PATTERNS` (one list, shared, value group only so keys survive) plus a
+unquoted value assigned to a credential-named key (`KEY=<value>`, any length
+from 8, unless the right side is code such as `os.environ[...]`), plus a
+random-token check. That check judges each separator-free part (`/ . _ - @ =`)
+of a 20+ character token (16+ characters) against a floor for its alphabet — hex
+cannot exceed 4 bits per character, so one floor for all would miss most hex
+keys. It skips `sha512-` integrity strings, camelCase names and the alert's own
+file path, and skips 40- and 64-hex only where the line marks it as a git SHA or
+checksum (`index`, `commit`, `@`, `#`, `revision`, `checksum`, `resolved`, …);
+anywhere else such a value is treated as a key. Measured on 500 random hex
+values each: `-KEY=<hex>` 100% at every length from 8 to 64; bare hex in prose
+97% at 20, 100% at 32, 40 and 64, but 0% below 20 characters. On 1000 random
+strings, 82% of 20-character and ~95% of 32-character base64 caught. Paths,
+names and SHAs in diff headers and lockfiles are left alone. Over-redaction is
+the accepted failure here; under-redaction is not.
+
+All of this runs over text an attacker can write, so its cost is bounded too.
+Names are matched by bounded, start-anchored patterns; the unquoted `KEY=value`
+form is scanned by hand rather than with a lookahead, after `"a=" * N + "."`
+took 68 s at 100 KB; the digest-context look-back reads at most 256 characters.
+Tests drive eight hostile shapes at 100 KB and 1 MB through the redactor,
+candidate extraction and the sanity gate's patterns, in a child process with a
+hard timeout, and require each to finish in under a second. A fallback scan also
+reads at most `REDACT_LIMIT` (128 KB) per call. Past that the text is withheld,
+replaced by a marker saying so — never passed through unscanned — and the cut
+moves back to whitespace so no token is scanned half. A snippet line over
+4,096 characters is not used for candidates, and its presence sends the alert
+to the fallback. Shapes can miss a credential, so the alert is also flagged
+`needs-review` with that reason in the PR body, before the fix agent runs.
+
 ## Degradation policy
 
 A harness that fails closed on every unknown never finishes; one that fails open
@@ -372,12 +575,13 @@ of a bad fix, fail open on absence of evidence — and say so.**
 | Orca check reports findings | **Closed after retries** — per `on_failure`. The PR is already open, so a `FAILED` here, or a retry that is abandoned, also labels it `needs-review` and puts the reason in its body |
 | CI red | **Closed** — `CI_FAILED`, exit 1, PR labelled |
 | Branch holds commits not in `main` | **Closed** — `SKIPPED`, work untouched |
-| LLM validation times out / errors / returns unparseable output | Open + `needs-review` |
+| LLM validation times out / errors / returns unparseable output or an unknown verdict | Open + `needs-review` — an explicit `unconfirmed` outcome with its own reason in the PR body, never a pass |
 | Orca check absent after the grace period | Open + `needs-review` (`on_not_found: fail` inverts this) |
 | PR has no CI configured, or `gh` is missing | Open + `needs-review` |
 | Build toolchain not installed | Open — skipped |
 | OSV / deps.dev unreachable, unknown ecosystem, unparsed manifest | Open — unguided fix + `needs-review` |
 | Impact analysis fails | Open — recorded as `medium`, error kept in the event log |
+| Secret finding whose `code_snippet` is masked or has no usable value | Open — redaction by pattern and entropy instead of exact value, `needs-review` |
 
 The one asymmetry worth naming: the advisory lookup that judges an
 agent-chosen version fails *open*, because an OSV outage should not turn into a
@@ -492,3 +696,53 @@ Stated plainly, because a gate list reads as a guarantee otherwise.
 - **Gate 4 depends on an integration outside this repo.** If the Orca GitHub App
   is not posting checks, the strongest gate degrades to `needs-review`.
   `on_not_found: fail` makes that loud where silence is worse.
+
+---
+
+## Residual risk
+
+The git and credential controls above narrow what repository code can reach.
+They do not contain it, and this section says where they stop.
+
+**The structural limit.** The fix agent's lockfile regens and every build check
+run tenant-written code as the operator: same OS user, real `HOME`, same network.
+That code can:
+- read anything the operator can (`~/.config/gh`, `~/.ssh`, `~/.aws`), or run
+  `gh auth token`;
+- write `~/.gitconfig`. The plugin's own git ignores that, through the snapshot,
+  but the operator's other tools do not, and the plugin neither detects nor
+  reports the change;
+- find and rewrite the plugin's config snapshot. That is detected by its hash,
+  and the run fails closed, but it cannot be prevented;
+- leave its process group with `setsid()` or `setpgid()` and outlive the
+  check;
+- make and revert a config change between two checks;
+- change things outside git config, such as `~/.ssh/config`.
+
+The environment allowlists and the git overrides decide what such code is
+*handed*. They are not a sandbox. Real containment means running the fix agent
+and the build checks in a sandbox — a container, or a separate OS user with no
+access to the operator's home or credentials. **That is the follow-up design item
+this harness needs, and it should be tracked as one.**
+
+**Commits the gates never see.** A build or regen step can run `git add` or
+`git commit` itself, in the worktree. The gates judge `git diff` against HEAD,
+so a commit made that way is not in the diff they read, and the push sends HEAD
+— that commit included. This is also true on `main`. Both commit paths now
+refuse a worktree with undeclared changes left over, but that does not cover a
+commit already made.
+
+**Known plugin-git config writes.** Only git-lfs's `lfs.<url>.access` and
+`lfs.<url>.locksverify` are accepted after plugin git runs. Any other config
+write by a tool the plugin invokes — a future git, a credential helper writing
+into repository config — poisons the clone and fails every later alert in it.
+
+**Untested here:**
+- a live HTTPS push and the real gh credential flow;
+- `url.*.insteadOf` and `pushInsteadOf` rewrites in the push window, which only
+  the drift check covers;
+- git older than 2.32, where only the refuse-to-start path is tested, by mock;
+- process-group escapees;
+- the pid-reuse window of the `waitid` fallback on macOS CPython before 3.13;
+- partial clones, which `protocol.allow=never` makes fail rather than fetch.
+

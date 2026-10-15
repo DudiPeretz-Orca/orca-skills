@@ -20,10 +20,18 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from _json_util import find_last_json_with_key
-from agent_env import agent_env, build_env
+from agent_env import (
+    SAFE_GIT,
+    agent_env,
+    build_env,
+    credentialed_env,
+    git_env,
+    neutral_dir,
+    run_in_group,
+)
 from orca_client import _resolve_feature_type
 from paths import resolve_within
-from redact import build_redactor
+from redact import SECRET_PATTERNS, build_redactor
 from untrusted import bound, bound_strings, fence, new_nonce, preamble
 
 
@@ -32,7 +40,17 @@ class ValidationResult:
     passed: bool
     phase: str                        # "sanity" | "llm" | "local_build" | "ci" | "orca_check"
     failures: list[str] = field(default_factory=list)
-    needs_review: bool = False        # True when LLM verdict is "uncertain"
+    needs_review: bool = False        # True when a gate passed without confirming
+    # Gate 2 only: "pass" | "fail" | "uncertain" | "unconfirmed". "unconfirmed"
+    # means no verdict was obtained at all — a timeout, an error, output that
+    # could not be read — which is not the model saying "uncertain".
+    outcome: str = ""
+
+    def __post_init__(self):
+        # A gate that could not confirm must never read as a clean pass, so the
+        # flag cannot be left off by whoever builds the result.
+        if self.outcome == "unconfirmed":
+            self.needs_review = True
 
 
 @dataclass
@@ -82,7 +100,7 @@ your reasoning. Answer directly.
 _SINGLE_SHOT_MAX_TURNS = 1
 
 
-def _subprocess_error_detail(result, limit: int = 500) -> str:
+def _subprocess_error_detail(result, limit: int = 500, redactor=None) -> str:
     """Best available explanation for a failed subprocess.
 
     `claude -p --output-format json` reports its own failures in a JSON envelope
@@ -90,22 +108,28 @@ def _subprocess_error_detail(result, limit: int = 500) -> str:
     "(no stderr)" and threw away the actual cause. Prefer stderr when there is
     one, fall back to stdout, and surface the envelope's subtype when present
     because that is the field that names the failure (e.g. error_max_turns).
+
+    redactor: applied before the cut, never after — a slice can end mid-credential
+              and leave a prefix no exact candidate matches.
     """
+    def cap(text: str) -> str:
+        return (redactor(text) if redactor else text)[:limit]
+
     stderr = (result.stderr or "").strip()
     stdout = (result.stdout or "").strip()
     if stderr:
-        return stderr[:limit]
+        return cap(stderr)
     if not stdout:
         return "(no output)"
     try:
         envelope = json.loads(stdout)
     except json.JSONDecodeError:
-        return stdout[:limit]
+        return cap(stdout)
     if isinstance(envelope, dict):
         subtype = envelope.get("subtype") or envelope.get("error")
         if subtype:
-            return f"{subtype}: {json.dumps(envelope)[:limit]}"
-    return stdout[:limit]
+            return f"{subtype}: {cap(json.dumps(envelope))}"
+    return cap(stdout)
 
 
 def worktree_diff(worktree_path: Path) -> str:
@@ -117,10 +141,13 @@ def worktree_diff(worktree_path: Path) -> str:
     shows up, which keeps every gate (sanity, LLM, impact) judging the same set
     of changes the commit will actually contain. Honours .gitignore.
     """
-    subprocess.run(["git", "add", "-A", "-N"],
-                   cwd=worktree_path, capture_output=True, text=True)
-    return subprocess.run(["git", "diff"],
-                          cwd=worktree_path, capture_output=True, text=True).stdout
+    subprocess.run([*SAFE_GIT, "add", "-A", "-N"],
+                   cwd=worktree_path, capture_output=True, text=True, env=git_env())
+    # No external diff driver and no textconv: both are commands a clone's
+    # config can name, and the diff is what every gate reads.
+    return subprocess.run([*SAFE_GIT, "diff", "--no-ext-diff", "--no-textconv"],
+                          cwd=worktree_path, capture_output=True, text=True,
+                          env=git_env()).stdout
 
 
 def diff_line_count(diff_text: str) -> int:
@@ -147,11 +174,9 @@ def diff_line_count(diff_text: str) -> int:
 # same alert, so at 50 that whole class of finding could never pass.
 _DIFF_LIMITS = {"sast": 100, "iac": 50, "secret": 50, "cve": 200}
 
-_SECRET_PATTERNS = [
-    r'(?i)(api_?key|password|secret|token)\s*[=:]\s*["\'][^"\']{8,}["\']',
-    r'sk-[A-Za-z0-9]{20,}',
-    r'(?i)bearer\s+[A-Za-z0-9+/]{20,}',
-]
+# One list, owned by redact.py, so the shapes this gate refuses to add and the
+# shapes the redactor falls back to scrubbing cannot drift apart.
+_SECRET_PATTERNS = SECRET_PATTERNS
 
 
 _VERSION_TOKEN = re.compile(r"\bv?\d+\.\d+(?:\.\d+)*(?:[-+.][0-9A-Za-z.-]+)?\b")
@@ -205,7 +230,8 @@ def _claimed_new_versions(summary: str) -> list:
 def sanity_check(alert: dict, worktree_path: Path,
                  feature_type: str | None = None,
                  diff_limit: int | None = None,
-                 diff_summary: str | None = None) -> ValidationResult:
+                 diff_summary: str | None = None,
+                 diff_text: str | None = None) -> ValidationResult:
     """Phase 1 gate: the diff is non-empty, within size limits, and adds no secrets.
 
     feature_type: the *resolved* type ("cve"/"sast"/"iac"/"secret"), which selects
@@ -218,11 +244,14 @@ def sanity_check(alert: dict, worktree_path: Path,
                   back to the _DIFF_LIMITS table when absent.
     diff_summary: the fix agent's own account of what it did. When given, it is
                   checked against the diff — see summary_version_mismatch.
+    diff_text:    the diff, when the caller already took it — the orchestrator
+                  does, holding the clone exclusively after checking its config.
     """
     failures = []
     ft = (feature_type or _resolve_feature_type(alert) or "sast").lower()
 
-    diff_text = worktree_diff(worktree_path)
+    if diff_text is None:
+        diff_text = worktree_diff(worktree_path)
     if not diff_text.strip():
         return ValidationResult(passed=False, phase="sanity",
                                 failures=["git diff is empty — no changes were made"])
@@ -281,11 +310,14 @@ Return ONLY this JSON, with nothing before or after it:
 """
 
 
-def llm_validate(alert: dict, worktree_path: Path, timeout_sec: int = 90) -> ValidationResult:
+def llm_validate(alert: dict, worktree_path: Path, timeout_sec: int = 90,
+                 diff_text: str | None = None) -> ValidationResult:
     redactor = build_redactor(alert)
+    if diff_text is None:
+        diff_text = worktree_diff(worktree_path)
     # Redact before truncating, not after: slicing first can cut a credential in
     # half and leave a fragment no candidate matches.
-    diff_text = bound(redactor(worktree_diff(worktree_path)), 5000)
+    diff_text = bound(redactor(diff_text), 5000)
 
     # Both halves are repository content: alert_json carries code_snippet, and a
     # diff is the file it came from. A verdict is worth steering — "pass" here is
@@ -312,22 +344,35 @@ def llm_validate(alert: dict, worktree_path: Path, timeout_sec: int = 90) -> Val
                                 timeout=timeout_sec, env=agent_env())
     except subprocess.TimeoutExpired:
         print(f"[WARN] LLM validation timed out after {timeout_sec}s")
-        return ValidationResult(passed=True, phase="llm", needs_review=True,
-                                failures=["LLM validation timed out — flagged for human review"])
+        return _unconfirmed(f"LLM validation timed out after {timeout_sec}s")
 
     if result.returncode != 0:
         # The CLI's own failure output can echo the prompt back, so it is an
         # egress path too — the console here, and `failures` onward.
-        detail = redactor(_subprocess_error_detail(result))
+        detail = _subprocess_error_detail(result, redactor=redactor)
         print(f"[WARN] LLM validation failed (exit={result.returncode}): {detail}")
-        return ValidationResult(passed=True, phase="llm", needs_review=True,
-                                failures=[f"LLM validation errored (exit={result.returncode}): {detail}"])
+        return _unconfirmed(f"LLM validation errored (exit={result.returncode}): {detail}")
 
     return _parse_llm(result.stdout, redactor)
 
 
+def _unconfirmed(why: str) -> ValidationResult:
+    """Gate 2 obtained no verdict. Ships, labelled needs-review — never as a pass.
+
+    Not a block: the degradation policy in HARNESS.md is fail closed on evidence
+    of a bad fix and open on absence of evidence, and a timeout is the latter.
+    """
+    return ValidationResult(passed=True, phase="llm", outcome="unconfirmed",
+                            failures=[f"{why} — flagged for human review"])
+
+
 def _parse_llm(raw: str, redactor=None) -> ValidationResult:
     """Parse the validation verdict.
+
+    Only an explicit "pass" passes. A verdict outside the three the prompt asks
+    for used to fall through to the final branch and ship as a clean pass with
+    no review marker, which is the one outcome a gate that read nothing must not
+    produce.
 
     redactor: scrubs the model's own prose. Asked to explain a secret fix, a model
               will happily name the credential it saw, and `reason` flows on to the
@@ -337,26 +382,30 @@ def _parse_llm(raw: str, redactor=None) -> ValidationResult:
     try:
         envelope = json.loads(raw)
         text = envelope.get("result", "") or raw
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, AttributeError):
         text = raw
 
-    data = find_last_json_with_key(text, "verdict")
+    data = find_last_json_with_key(text, "verdict") if text else None
     if not data:
-        snippet = redactor(text[:200]) if text else "(empty)"
+        snippet = redactor(text)[:200] if text else "(empty)"
         print(f"[WARN] could not parse LLM validation output: {snippet}")
-        return ValidationResult(passed=True, phase="llm", needs_review=True,
-                                failures=[f"Could not parse LLM validation response: {snippet}"])
+        return _unconfirmed(f"Could not parse LLM validation response: {snippet}")
 
-    verdict = data.get("verdict", "uncertain")
-    reason = redactor(data.get("reason", ""))
-    concerns = redactor.scrub(data.get("concerns") or [])
+    raw_verdict = data.get("verdict")
+    verdict = raw_verdict.strip().lower() if isinstance(raw_verdict, str) else ""
+    reason = redactor(str(data.get("reason") or ""))
+    concerns = data.get("concerns") or []
+    concerns = redactor.scrub([concerns] if isinstance(concerns, str) else list(concerns))
 
     if verdict == "fail":
-        return ValidationResult(passed=False, phase="llm", failures=[reason])
-    elif verdict == "uncertain":
-        return ValidationResult(passed=True, phase="llm", needs_review=True, failures=concerns)
-    else:
-        return ValidationResult(passed=True, phase="llm")
+        return ValidationResult(passed=False, phase="llm", outcome="fail", failures=[reason])
+    if verdict == "uncertain":
+        return ValidationResult(passed=True, phase="llm", outcome="uncertain",
+                                needs_review=True, failures=concerns)
+    if verdict == "pass":
+        return ValidationResult(passed=True, phase="llm", outcome="pass")
+    shown = redactor(str(raw_verdict))[:40]
+    return _unconfirmed(f"LLM validation returned no recognised verdict ({shown!r})")
 
 
 # ---------------------------------------------------------------------------
@@ -375,12 +424,15 @@ def local_build_check(
     files_changed: list[str],
     worktree_path: Path,
     source_file: str = "",
+    redactor=None,
 ) -> ValidationResult:
     """Run a language-appropriate build check after a fix is applied.
 
     source_file: the affected file path from the Orca alert (authoritative).
                  Used as the primary seed for project-root detection; falls back
                  to files_changed if empty.
+    redactor:    applied to build output before it is cut — a compiler quotes the
+                 line it fails on, which for a secret fix is the credential.
     """
     # Seed with the alert's source file first — it's authoritative and available
     # before the fix agent runs, unlike files_changed which comes from agent output.
@@ -392,15 +444,15 @@ def local_build_check(
 
     if ext == ".go":
         go_root = _find_project_root(all_files, worktree_path, "go.mod")
-        return _run_check(["go", "build", "./..."], go_root)
+        return _run_check(["go", "build", "./..."], go_root, redactor)
     elif ext == ".py":
-        return _check_python(files_changed, worktree_path)
+        return _check_python(files_changed, worktree_path, redactor)
     elif ext in (".js", ".ts"):
         npm_root = _find_project_root(all_files, worktree_path, "package.json")
-        return _run_check(["npm", "run", "build", "--if-present"], npm_root)
+        return _run_check(["npm", "run", "build", "--if-present"], npm_root, redactor)
     elif ext == ".tf":
         tf_root = _find_terraform_root(all_files, worktree_path)
-        return _run_check(["terraform", "validate"], tf_root)
+        return _run_check(["terraform", "validate"], tf_root, redactor)
     else:
         # No build check for YAML/Dockerfile/etc. — skip gracefully
         return ValidationResult(passed=True, phase="local_build")
@@ -410,39 +462,44 @@ def _find_project_root(files: list[str], worktree_path: Path, marker: str) -> Pa
     """Walk up from each file to find the nearest directory containing `marker`.
 
     Works for any project root indicator: go.mod, package.json, etc.
-    Falls back to worktree_path if not found.
+    Falls back to the worktree root if not found. Returns resolved paths.
     """
+    # resolve_within hands back resolved paths, so the root they are walked up
+    # to has to be resolved too. Comparing against the path as spelled never
+    # matched where the worktree sits under a symlink — on macOS /tmp is one —
+    # and every lookup fell back to the worktree root.
+    root = Path(worktree_path).resolve()
     for f in files:
         # Strip line number suffix (e.g. "nodejs-app/server.js:40" → "nodejs-app/server.js")
         clean = f.split(":")[0] if ":" in f else f
         # `worktree_path / clean` does not normalise, so a "../" in an alert's
-        # source used to walk straight out of the worktree — and the loop guard
-        # below compares paths lexicographically, which does not catch it.
-        inside = resolve_within(worktree_path, clean)
+        # source used to walk straight out of the worktree.
+        inside = resolve_within(root, clean)
         if inside is None:
             continue
         candidate = inside.parent
-        while candidate >= worktree_path:
+        while candidate == root or root in candidate.parents:
             if (candidate / marker).exists():
                 return candidate
-            if candidate == worktree_path:
+            if candidate == root:
                 break
             candidate = candidate.parent
-    return worktree_path
+    return root
 
 
 def _find_terraform_root(files: list[str], worktree_path: Path) -> Path:
     """Find the directory containing .tf files — the terraform module root."""
+    root = Path(worktree_path).resolve()
     for f in files:
         if not f.endswith(".tf"):
             continue
-        inside = resolve_within(worktree_path, f)
+        inside = resolve_within(root, f)
         if inside is None:
             continue
         tf_dir = inside.parent
         if tf_dir.exists():
             return tf_dir
-    return worktree_path
+    return root
 
 
 # Keep old names as aliases for backward compat with existing callers/tests
@@ -454,35 +511,33 @@ def _find_go_module_root(files: list[str], worktree_path: Path) -> Path:
     return _find_project_root(files, worktree_path, "go.mod")
 
 
-def _run_check(cmd: list[str], cwd: Path) -> ValidationResult:
+def _run_check(cmd: list[str], cwd: Path, redactor=None) -> ValidationResult:
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120, cwd=cwd,
-                                env=build_env())
+        result = run_in_group(cmd, timeout=120, cwd=cwd, env=build_env())
     except subprocess.TimeoutExpired:
         return ValidationResult(passed=False, phase="local_build",
                                 failures=[f"local build timed out ({' '.join(cmd)})"])
     except FileNotFoundError:
         return ValidationResult(passed=True, phase="local_build")  # tool not installed — skip
     if result.returncode != 0:
-        out = (result.stdout + result.stderr)[:400]
+        out = (redactor or build_redactor(None))(result.stdout + result.stderr)[:400]
         return ValidationResult(passed=False, phase="local_build",
                                 failures=[f"local build failed: {out}"])
     return ValidationResult(passed=True, phase="local_build")
 
 
-def _check_python(files: list[str], cwd: Path) -> ValidationResult:
+def _check_python(files: list[str], cwd: Path, redactor=None) -> ValidationResult:
     failures = []
     for f in files:
         if not f.endswith(".py"):
             continue
         # -I: `-m` otherwise searches the current directory first, which is the
         # cloned tree in single-repo mode, so a committed py_compile.py would run.
-        result = subprocess.run(
-            ["python3", "-I", "-m", "py_compile", str(cwd / f)],
-            capture_output=True, text=True, timeout=15, env=build_env(),
-        )
+        result = run_in_group(["python3", "-I", "-m", "py_compile", str(cwd / f)],
+                              timeout=15, env=build_env())
         if result.returncode != 0:
-            failures.append(f"syntax error in {f}: {result.stderr[:150]}")
+            detail = (redactor or build_redactor(None))(result.stderr)[:150]
+            failures.append(f"syntax error in {f}: {detail}")
     return ValidationResult(passed=len(failures) == 0, phase="local_build", failures=failures)
 
 
@@ -506,7 +561,7 @@ def ci_gate(pr_url: str, timeout_sec: int = 600) -> ValidationResult:
     try:
         result = subprocess.run(
             ["gh", "pr", "checks", pr_url, "--watch", "--fail-fast"],
-            capture_output=True, text=True, timeout=timeout_sec,
+            capture_output=True, text=True, timeout=timeout_sec, env=credentialed_env(), cwd=neutral_dir(),
         )
     except subprocess.TimeoutExpired:
         return ValidationResult(passed=False, phase="ci",
@@ -552,7 +607,7 @@ def _get_pr_head_sha(pr_url: str) -> str:
     """Get the HEAD SHA for a PR using gh CLI."""
     result = subprocess.run(
         ["gh", "pr", "view", pr_url, "--json", "headRefOid", "--jq", ".headRefOid"],
-        capture_output=True, text=True, timeout=30,
+        capture_output=True, text=True, timeout=30, env=credentialed_env(), cwd=neutral_dir(),
     )
     if result.returncode != 0:
         raise RuntimeError(f"gh pr view failed: {result.stderr[:200]}")
@@ -567,7 +622,7 @@ def _find_orca_check_run(owner_repo: str, sha: str, check_name: str) -> dict | N
     result = subprocess.run(
         ["gh", "api", f"repos/{owner_repo}/commits/{sha}/check-runs",
          "--jq", ".check_runs"],
-        capture_output=True, text=True, timeout=30,
+        capture_output=True, text=True, timeout=30, env=credentialed_env(), cwd=neutral_dir(),
     )
     if result.returncode != 0:
         return None
@@ -586,7 +641,7 @@ def _get_check_annotations(owner_repo: str, check_run_id: int) -> list[OrcaCheck
     """Fetch annotations for a check run and return structured findings."""
     result = subprocess.run(
         ["gh", "api", f"repos/{owner_repo}/check-runs/{check_run_id}/annotations"],
-        capture_output=True, text=True, timeout=30,
+        capture_output=True, text=True, timeout=30, env=credentialed_env(), cwd=neutral_dir(),
     )
     if result.returncode != 0:
         return []

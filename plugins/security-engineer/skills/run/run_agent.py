@@ -15,6 +15,14 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "lib"))
+from agent_env import (
+    SAFE_GIT,
+    credentialed_env,
+    git_env,
+    neutral_dir,
+    push_git,
+    signing_env,
+)
 from orca_client import (
     RISK_ORDER,
     _resolve_feature_type,
@@ -33,12 +41,22 @@ from version_data import ecosystem_for_manifest, resolve_bump, resolve_ecosystem
 # Helpers
 # ---------------------------------------------------------------------------
 
-def run(cmd, check=True, capture=True, cwd=None):
-    """Run a shell command. Returns (stdout, stderr, returncode)."""
-    result = subprocess.run(
-        cmd, shell=isinstance(cmd, str),
-        capture_output=capture, text=True, cwd=cwd
-    )
+def run(cmd, check=True, capture=True, cwd=None, env=None, timeout=300):
+    """Run a command. Returns (stdout, stderr, returncode).
+
+    env defaults to git_env(), which holds no credential; the push, the commit
+    and gh pass credentialed_env() explicitly. timeout: the orchestrator calls
+    the commit and the push holding the clone exclusively, so a hung push must
+    end; expiry raises RuntimeError like any failed command.
+    """
+    try:
+        result = subprocess.run(
+            cmd, shell=isinstance(cmd, str),
+            capture_output=capture, text=True, cwd=cwd, timeout=timeout,
+            env=env if env is not None else git_env()
+        )
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError(f"timed out after {timeout}s: {cmd!r:.120}") from e
     if check and result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or f"Command failed: {cmd}")
     return result.stdout.strip(), result.stderr.strip(), result.returncode
@@ -47,7 +65,7 @@ def run(cmd, check=True, capture=True, cwd=None):
 def detect_repo():
     """Detect owner/repo from git remote."""
     try:
-        url, _, _ = run(["git", "remote", "get-url", "origin"])
+        url, _, _ = run([*SAFE_GIT, "remote", "get-url", "origin"])
         if "github.com/" in url:
             return url.split("github.com/")[-1].removesuffix(".git")
         elif "github.com:" in url:
@@ -274,7 +292,7 @@ def cmd_git_setup(args):
 
     try:
         run(["git", "checkout", "main"])
-        run(["git", "pull", "origin", "main"])
+        run(["git", "pull", "origin", "main"], env=credentialed_env())
         _, stderr, rc = run(["git", "checkout", "-b", branch], check=False)
         if rc != 0:
             if "already exists" in stderr:
@@ -305,9 +323,9 @@ def _stage(paths):
     always passes them; the fallback is for a human driving this CLI by hand.
     """
     if not paths:
-        run(["git", "add", "-A"])
+        run([*SAFE_GIT, "add", "-A"])
         return
-    run(["git", "add", "--", *paths])
+    run([*SAFE_GIT, "add", "--", *paths])
     leftover = _unaccounted_changes()
     if leftover:
         raise RuntimeError(
@@ -322,9 +340,14 @@ def _unaccounted_changes():
     file the agent changed and did not report, or something its Bash left behind.
     We cannot tell those apart from here, and both are reasons not to push.
     """
-    out, _, _ = run(["git", "status", "--porcelain", "--untracked-files=all"])
+    out, _, _ = run([*SAFE_GIT, "status", "--porcelain", "--untracked-files=all"])
+    return leftover_paths(out)
+
+
+def leftover_paths(porcelain: str) -> list:
+    """From `git status --porcelain` after staging: what was not staged by name."""
     leftover = []
-    for line in out.splitlines():
+    for line in porcelain.splitlines():
         if len(line) < 4:
             continue
         index_state, worktree_state, path = line[0], line[1], line[3:]
@@ -340,9 +363,10 @@ def cmd_git_commit(args):
 
     try:
         _stage(getattr(args, "path", None) or [])
-        run(["git", "commit", "-m", args.message])
-        # Extract SHA from "1 file changed" line or git log
-        sha, _, _ = run(["git", "rev-parse", "--short", "HEAD"])
+        # The signing agent's socket and nothing else: a clean filter can run
+        # during the commit, and it gets no token.
+        run([*SAFE_GIT, "commit", "--no-verify", "-m", args.message], env=signing_env())
+        sha, _, _ = run([*SAFE_GIT, "rev-parse", "--short", "HEAD"])
         print(sha)
     except RuntimeError as e:
         print(f"error: {e}", file=sys.stderr)
@@ -357,14 +381,29 @@ def cmd_open_pr(args):
         return
 
     try:
-        run(["git", "push", "-u", "origin", branch])
+        repo = detect_repo()
+        if not repo:
+            raise RuntimeError("could not read the repository from the origin remote")
+        # An explicit refspec and no -u: recording the upstream writes the shared
+        # .git/config, which the drift check would then read as tampering.
+        # The URL recorded before repository code ran, not whatever the remote
+        # says now. By hand, without --push-url, it is read here.
+        url = getattr(args, "push_url", None)
+        if not url:
+            url, _, _ = run([*SAFE_GIT, "remote", "get-url", "--push", "origin"])
+        run([*push_git(url), "push", "--no-verify", url, f"HEAD:refs/heads/{branch}"],
+            env=credentialed_env())
+        # Named explicitly and run outside the clone: gh otherwise inspects the
+        # repository in its cwd with our credentials and none of push_git's
+        # overrides.
         pr_url, _, _ = run([
             "gh", "pr", "create",
+            "--repo", repo,
             "--title", args.title,
             "--body", args.body,
             "--base", "main",
             "--head", branch
-        ])
+        ], cwd=neutral_dir(), env=credentialed_env())
         print(pr_url)
     except RuntimeError as e:
         print(f"error: {e}", file=sys.stderr)
@@ -435,6 +474,8 @@ def main():
     p_pr.add_argument("alert_id")
     p_pr.add_argument("--title", required=True)
     p_pr.add_argument("--body", required=True)
+    p_pr.add_argument("--push-url", default=None,
+                      help="Push here rather than to the remote's current URL")
 
     args = parser.parse_args()
 

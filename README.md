@@ -14,6 +14,9 @@
 
 ---
 
+Orca Skills supports both **Claude Code and Codex**. Both clients use the same
+`skills/` directory, with separate plugin manifests and installation instructions.
+
 ### Table of Contents
 - [Plugins](#plugins)
 - [Skills Overview](#skills-overview)

@@ -56,6 +56,8 @@ npm test
 
 Claude, Cursor, and Codex all use this single root `skills/` tree. Edit it once; do not create copies under `plugins/orca-skills/`. `npm test` checks the plugin manifests, marketplace sources, and skill metadata. With Codex CLI installed, `npm run test:codex` also verifies installation and discovery in a temporary home. See [README](README.md#testing).
 
+Keep shared skill instructions usable in both Claude and Codex. Label client-specific setup commands and usage examples clearly.
+
 The independent `security-engineer` plugin has its own [development setup and test suite](plugins/security-engineer/README.md#developing).
 
 **Note:** `.mcp.json` is gitignored. Never commit API tokens or credentials.
